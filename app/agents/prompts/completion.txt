@@ -1,0 +1,3 @@
+The interview has reached its conclusion. Produce a brief professional closing summary that reflects the candidate's technical journey, strengths, and areas for growth. Keep it concise and objective.
+
+Output only the completion summary text.
