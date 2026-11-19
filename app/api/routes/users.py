@@ -22,6 +22,16 @@ async def create_user(payload: UserCreate, db: AsyncSession = Depends(get_db)) -
     return UserRead.model_validate(user)
 
 
+@router.post("/sign-in", response_model=UserRead)
+async def sign_in(payload: UserCreate, db: AsyncSession = Depends(get_db)) -> UserRead:
+    """Passwordless demo sign-in: return the user with this email, creating it if needed."""
+    service = UserService(db)
+    user = await service.repository.get_by_email(payload.email)
+    if user is None:
+        user = await service.create(payload)
+    return UserRead.model_validate(user)
+
+
 @router.get("", response_model=list[UserRead])
 async def list_users(db: AsyncSession = Depends(get_db), offset: int = 0, limit: int = 100) -> list[UserRead]:
     service = UserService(db)

@@ -10,10 +10,24 @@ from app.schemas.candidate_profile import CandidateProfileCreate, CandidateProfi
 from app.schemas.job_description import JobDescriptionMatchResult, JobDescriptionRead
 from app.schemas.resume_document import ResumeDocumentRead
 from app.services.candidate_profile_service import CandidateProfileService
+from app.services.document_text import MAX_UPLOAD_BYTES, extract_text
 from app.services.job_description_service import JobDescriptionService
 from app.services.resume_document_service import ResumeDocumentService
 
 router = APIRouter(prefix="/candidate-profiles", tags=["candidate-profiles"])
+
+
+async def _read_upload_text(file: UploadFile, label: str) -> str:
+    raw_bytes = await file.read()
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"{label} file is larger than 5 MB")
+    try:
+        raw_text = extract_text(raw_bytes, file.filename, file.content_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if not raw_text.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{label} file is empty")
+    return raw_text
 
 
 @router.post("", response_model=CandidateProfileRead, status_code=status.HTTP_201_CREATED)
@@ -83,10 +97,7 @@ async def upload_candidate_resume(
     if candidate is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate profile not found")
 
-    raw_bytes = await file.read()
-    raw_text = raw_bytes.decode("utf-8", errors="replace")
-    if not raw_text.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Resume file is empty")
+    raw_text = await _read_upload_text(file, "Resume")
 
     resume_service = ResumeDocumentService(db)
     resume = await resume_service.create_for_candidate(
@@ -121,10 +132,7 @@ async def upload_job_description(
     if candidate is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate profile not found")
 
-    raw_bytes = await file.read()
-    raw_text = raw_bytes.decode("utf-8", errors="replace")
-    if not raw_text.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job description file is empty")
+    raw_text = await _read_upload_text(file, "Job description")
 
     jd_service = JobDescriptionService(db)
     job_description = await jd_service.create_for_candidate(

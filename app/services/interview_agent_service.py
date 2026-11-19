@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -12,7 +13,11 @@ from app.models.transcript_entry import TranscriptEntry
 from app.prompts.manager import PromptManager
 from app.providers.base_provider import BaseLLMProvider
 from app.repositories.interview_session_repository import InterviewSessionRepository
+from app.repositories.job_description_repository import JobDescriptionRepository
+from app.repositories.resume_document_repository import ResumeDocumentRepository
 from app.repositories.transcript_entry_repository import TranscriptEntryRepository
+
+logger = logging.getLogger(__name__)
 
 
 class InterviewAgentService:
@@ -200,13 +205,23 @@ class InterviewMVPService:
         self.repository = InterviewSessionRepository(session)
         self.transcript_repository = TranscriptEntryRepository(session)
 
-    async def start(self, *, title: str, candidate_profile_id: UUID | None = None) -> dict[str, Any]:
+    async def start(
+        self,
+        *,
+        title: str,
+        candidate_profile_id: UUID | None = None,
+        job_description_id: UUID | None = None,
+    ) -> dict[str, Any]:
         if candidate_profile_id is None:
             raise ValueError("candidate_profile_id is required")
 
+        context = await self._build_context(candidate_profile_id, job_description_id)
         stage = self._resolve_stage(1)
-        question = await self._generate_question(previous_question=None, previous_answer=None, stage=stage)
+        question = await self._generate_question(
+            previous_question=None, previous_answer=None, stage=stage, context=context
+        )
         state = {
+            "context": context,
             "current_stage": stage,
             "turn_count": 1,
             "topics_covered": [stage],
@@ -262,9 +277,11 @@ class InterviewMVPService:
         history = await self.get_history(interview_session_id)
         prior_question = state.get("last_question")
 
+        existing_entries = await self.transcript_repository.get_by_interview_session_id(interview_session.id)
+        candidate_sequence = max((item.sequence_number for item in existing_entries), default=0) + 1
         transcript_entry = TranscriptEntry(
             interview_session_id=interview_session.id,
-            sequence_number=len(await self.transcript_repository.get_by_interview_session_id(interview_session.id)) + 1,
+            sequence_number=candidate_sequence,
             speaker="candidate",
             content=answer,
         )
@@ -296,6 +313,7 @@ class InterviewMVPService:
             previous_answer=answer,
             stage=next_stage,
             history=history.get("history", []),
+            context=state.get("context") or {},
         )
         interview_session.current_turn = next_turn
         interview_session.status = "in_progress"
@@ -314,7 +332,7 @@ class InterviewMVPService:
 
         follow_up_entry = TranscriptEntry(
             interview_session_id=interview_session.id,
-            sequence_number=len(await self.transcript_repository.get_by_interview_session_id(interview_session.id)) + 2,
+            sequence_number=candidate_sequence + 1,
             speaker="interviewer",
             content=question,
         )
@@ -426,8 +444,18 @@ class InterviewMVPService:
         previous_answer: str | None,
         stage: str,
         history: list[dict[str, Any]] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str:
         history = history or []
+        context = context or {}
+
+        if self._uses_real_llm():
+            try:
+                question = await self._generate_llm_question(stage=stage, history=history, context=context)
+                if question:
+                    return question
+            except Exception:  # fall back to the rule-based bank if the provider fails
+                logger.warning("LLM question generation failed; using fallback question bank", exc_info=True)
         recent_context = ""
         if history:
             latest = history[-3:]
@@ -444,6 +472,18 @@ class InterviewMVPService:
             "wrap_up": "If you could improve one area of your profile or career trajectory, what would you focus on next?",
         }
 
+        focus_skills = context.get("required_skills") or context.get("resume_skills") or []
+        role = context.get("job_title")
+        if stage == "technical" and focus_skills:
+            question_map["technical"] = (
+                f"Describe a technical challenge you solved using {', '.join(focus_skills[:3])}: "
+                "how you approached it, the trade-offs, and how you validated the result."
+            )
+        if stage == "introduction" and role:
+            question_map["introduction"] = (
+                f"To start, walk me through your background and why you're a good fit for the {role} role."
+            )
+
         base_question = question_map.get(stage, question_map["introduction"])
         if not previous_answer:
             return base_question
@@ -458,7 +498,74 @@ class InterviewMVPService:
             return "How did you influence the team or stakeholders when priorities changed, and what was the result?"
         if "api" in lower_answer or "database" in lower_answer or "service" in lower_answer:
             return "How did you decide on the design constraints for that service, and what trade-offs did you make?"
-        if previous_question:
-            return f"Building on your earlier answer about '{previous_question[:80]}', what would you do differently if you had to improve the outcome today?"
-
         return base_question
+
+    def _uses_real_llm(self) -> bool:
+        from app.llm.mock_provider import MockLLMProvider
+
+        return not isinstance(self.llm_provider, MockLLMProvider) and hasattr(self.llm_provider, "generate")
+
+    async def _build_context(self, candidate_profile_id: UUID, job_description_id: UUID | None) -> dict[str, Any]:
+        resumes = await ResumeDocumentRepository(self.session).get_by_candidate_profile_id(candidate_profile_id)
+        resume_skills: list[str] = []
+        for resume in resumes:
+            resume_skills.extend(skill for skill in (resume.skills or []) if skill not in resume_skills)
+        latest_resume = max(resumes, key=lambda item: item.created_at) if resumes else None
+
+        context: dict[str, Any] = {
+            "resume_skills": resume_skills,
+            "resume_summary": (latest_resume.extracted_summary or "")[:800] if latest_resume else "",
+        }
+        if job_description_id is not None:
+            job_description = await JobDescriptionRepository(self.session).get_by_id(job_description_id)
+            if job_description is None or job_description.candidate_profile_id != candidate_profile_id:
+                raise ValueError("Job description not found for this candidate")
+            context.update(
+                {
+                    "job_description_id": str(job_description.id),
+                    "job_title": job_description.title,
+                    "job_summary": (job_description.summary or "")[:800],
+                    "required_skills": list(job_description.required_skills or []),
+                }
+            )
+        return context
+
+    async def _generate_llm_question(
+        self, *, stage: str, history: list[dict[str, Any]], context: dict[str, Any]
+    ) -> str:
+        stage_goals = {
+            "introduction": "an opening question about the candidate's background and motivation",
+            "background": "a question about experiences that shaped their technical foundation",
+            "projects": "a question about a concrete project, their impact and trade-offs",
+            "technical": "a technical depth question tied to the role's required skills",
+            "wrap_up": "a reflective closing question about growth and next steps",
+        }
+        profile_lines = [
+            f"Target role: {context.get('job_title') or 'Software engineer'}",
+            f"Role summary: {context.get('job_summary') or 'n/a'}",
+            f"Required skills: {', '.join(context.get('required_skills') or []) or 'n/a'}",
+            f"Candidate skills (from resume): {', '.join(context.get('resume_skills') or []) or 'n/a'}",
+            f"Resume summary: {context.get('resume_summary') or 'n/a'}",
+        ]
+        transcript = "\n".join(
+            f"{item.get('speaker', 'unknown')}: {item.get('content', '')}" for item in history[-6:]
+        ) or "(no conversation yet)"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a supportive but rigorous technical interviewer running a mock interview for coaching. "
+                    "Ask exactly ONE clear question, under 45 words, with no preamble, numbering, or feedback. "
+                    "Build on the candidate's previous answer when relevant and do not repeat earlier questions."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "\n".join(profile_lines)
+                    + f"\n\nConversation so far:\n{transcript}\n\n"
+                    + f"Current stage: {stage}. Ask {stage_goals.get(stage, 'the next interview question')}."
+                ),
+            },
+        ]
+        return (await self.llm_provider.generate(messages)).strip().strip('"')

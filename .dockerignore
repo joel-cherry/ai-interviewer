@@ -21,3 +21,7 @@ htmlcov/
 # Local workspace
 .idea/
 .vscode/
+
+# Frontend build artefacts (rebuilt in the image)
+frontend/node_modules/
+frontend/dist/

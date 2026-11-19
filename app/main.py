@@ -1,6 +1,9 @@
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.health import router as health_router
@@ -40,8 +43,8 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=settings.cors_origin_list,
+        allow_credentials=settings.cors_origin_list != ["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -61,6 +64,10 @@ def create_app() -> FastAPI:
             "version": settings.project_version,
             "status": "ok",
         }
+
+    frontend_dist = Path(settings.frontend_dist_dir)
+    if (frontend_dist / "index.html").is_file():
+        app.mount("/app", StaticFiles(directory=frontend_dist, html=True), name="frontend")
 
     return app
 

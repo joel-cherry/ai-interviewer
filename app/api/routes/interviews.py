@@ -17,6 +17,7 @@ router = APIRouter(prefix="/interviews", tags=["interviews"])
 class InterviewStartRequest(BaseModel):
     title: str = Field(default="Technical Interview", min_length=1, max_length=255)
     candidate_profile_id: UUID
+    job_description_id: UUID | None = None
 
 
 class InterviewAnswerRequest(BaseModel):
@@ -30,7 +31,11 @@ async def start_interview(
 ) -> dict[str, object]:
     try:
         service = InterviewMVPService(db, llm_provider=get_llm_provider())
-        result = await service.start(title=payload.title, candidate_profile_id=payload.candidate_profile_id)
+        result = await service.start(
+            title=payload.title,
+            candidate_profile_id=payload.candidate_profile_id,
+            job_description_id=payload.job_description_id,
+        )
         return result
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

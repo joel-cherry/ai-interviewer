@@ -17,6 +17,16 @@ from app.models.transcript_entry import TranscriptEntry
 
 
 class InterviewEvaluationService:
+    DIMENSION_WEIGHTS = {
+        "technical_knowledge": 0.38,
+        "problem_solving": 0.22,
+        "communication": 0.18,
+        "role_fit": 0.12,
+        "confidence": 0.06,
+        "experience_relevance": 0.04,
+    }
+    REASONING_MARKERS = ("because", "trade-off", "tradeoff", "approach", "decided", "so that", "instead of")
+    HEDGE_MARKERS = ("i think", "maybe", "not sure", "i guess", "probably", "kind of", "sort of")
     TECHNICAL_KEYWORDS = {
         "api",
         "database",
@@ -102,61 +112,18 @@ class InterviewEvaluationService:
 
     async def get_scores(self, interview_session_id: UUID) -> dict[str, Any]:
         interview_session = await self._get_interview_session(interview_session_id)
-        evaluations = await self.session.execute(
-            select(AnswerEvaluation).where(AnswerEvaluation.interview_session_id == interview_session_id).order_by(AnswerEvaluation.created_at)
-        )
-        rows = evaluations.scalars().all()
-        if not rows:
+        query = select(CandidateScore).where(CandidateScore.interview_session_id == interview_session_id)
+        existing = (await self.session.execute(query)).scalar_one_or_none()
+        if existing is None:
             await self.evaluate_interview(interview_session_id)
-            rows = (await self.session.execute(
-                select(AnswerEvaluation).where(AnswerEvaluation.interview_session_id == interview_session_id).order_by(AnswerEvaluation.created_at)
-            )).scalars().all()
-
-        if not rows:
+            existing = (await self.session.execute(query)).scalar_one_or_none()
+        if existing is None:
             raise ValueError("No evaluation scores found for this interview")
-
-        score_values = {"technical_knowledge": 0.0, "problem_solving": 0.0, "communication": 0.0, "role_fit": 0.0, "confidence": 0.0, "experience_relevance": 0.0}
-        for row in rows:
-            score_values["technical_knowledge"] += row.score * 0.35
-            score_values["problem_solving"] += row.score * 0.25
-            score_values["communication"] += row.score * 0.2
-            score_values["role_fit"] += row.score * 0.1
-            score_values["confidence"] += row.score * 0.05
-            score_values["experience_relevance"] += row.score * 0.05
-
-        for key in score_values:
-            score_values[key] = round(score_values[key] / max(len(rows), 1), 2)
-
-        overall_score = round(sum(score_values.values()) / len(score_values), 2)
-        candidate_score = await self.session.execute(
-            select(CandidateScore).where(CandidateScore.interview_session_id == interview_session_id)
-        )
-        existing = candidate_score.scalar_one_or_none()
-        if existing is not None:
-            existing.technical_knowledge = score_values["technical_knowledge"]
-            existing.problem_solving = score_values["problem_solving"]
-            existing.communication = score_values["communication"]
-            existing.role_fit = score_values["role_fit"]
-            existing.confidence = score_values["confidence"]
-            existing.experience_relevance = score_values["experience_relevance"]
-            existing.overall_score = overall_score
-            await self.session.commit()
-            await self.session.refresh(existing)
-            return {
-                "interview_session_id": str(interview_session.id),
-                "technical_knowledge": existing.technical_knowledge,
-                "problem_solving": existing.problem_solving,
-                "communication": existing.communication,
-                "role_fit": existing.role_fit,
-                "confidence": existing.confidence,
-                "experience_relevance": existing.experience_relevance,
-                "overall_score": existing.overall_score,
-            }
 
         return {
             "interview_session_id": str(interview_session.id),
-            **score_values,
-            "overall_score": overall_score,
+            **{key: getattr(existing, key) for key in self.DIMENSION_WEIGHTS},
+            "overall_score": existing.overall_score,
         }
 
     async def get_report(self, interview_session_id: UUID) -> dict[str, Any]:
@@ -268,6 +235,7 @@ class InterviewEvaluationService:
             improvements.append("Mention the trade-offs and why the chosen approach was effective")
 
         stage = self._infer_stage(interview_session, question)
+        dimension_scores = self._dimension_scores(answer, len(words), keyword_hits, impact_hits, numeric_mentions > 0)
 
         return {
             "question_text": question,
@@ -277,6 +245,7 @@ class InterviewEvaluationService:
             "strengths": strengths,
             "weaknesses": weaknesses,
             "improvement_suggestions": improvements,
+            "dimension_scores": dimension_scores,
             "reasoning": (
                 "The response demonstrates concrete technical exposure and evidence of results, "
                 "but can be strengthened further with more explicit business impact and deeper trade-off analysis."
@@ -297,23 +266,43 @@ class InterviewEvaluationService:
                 return stage_name
         return "background" if (interview_session.current_turn or 0) <= 2 else "technical"
 
-    @staticmethod
-    def _summarize_scores(evaluated_answers: list[dict[str, Any]]) -> dict[str, float]:
-        if not evaluated_answers:
-            return {"technical_knowledge": 0.0, "problem_solving": 0.0, "communication": 0.0, "role_fit": 0.0, "confidence": 0.0, "experience_relevance": 0.0, "overall_score": 0.0}
-        totals = {"technical_knowledge": 0.0, "problem_solving": 0.0, "communication": 0.0, "role_fit": 0.0, "confidence": 0.0, "experience_relevance": 0.0}
-        for item in evaluated_answers:
-            total = float(item["score"])
-            totals["technical_knowledge"] += total * 0.38
-            totals["problem_solving"] += total * 0.22
-            totals["communication"] += total * 0.18
-            totals["role_fit"] += total * 0.12
-            totals["confidence"] += total * 0.06
-            totals["experience_relevance"] += total * 0.04
+    def _dimension_scores(
+        self, answer: str, word_count: int, keyword_hits: int, impact_hits: int, has_numbers: bool
+    ) -> dict[str, float]:
+        lower = answer.lower()
+        reasoning_hits = sum(marker in lower for marker in self.REASONING_MARKERS)
+        hedge_hits = sum(marker in lower for marker in self.HEDGE_MARKERS)
+        if word_count < 10:
+            communication = 40.0
+        elif word_count < 25:
+            communication = 55.0
+        elif word_count < 45:
+            communication = 70.0
+        elif word_count <= 220:
+            communication = 85.0
+        else:
+            communication = 75.0
+        raw = {
+            "technical_knowledge": 45 + min(45, keyword_hits * 9) + (10 if has_numbers else 0),
+            "problem_solving": 45 + min(30, impact_hits * 10) + min(15, reasoning_hits * 8) + (10 if has_numbers else 0),
+            "communication": communication + min(10, reasoning_hits * 5),
+            "role_fit": 50 + min(40, (keyword_hits + impact_hits) * 6) + (10 if word_count >= 25 else 0),
+            "confidence": 70 - hedge_hits * 10 + (10 if word_count >= 25 else 0) + (5 if has_numbers else 0),
+            "experience_relevance": 50 + (20 if has_numbers else 0) + min(30, impact_hits * 10),
+        }
+        return {key: round(float(min(100, max(0, value))), 2) for key, value in raw.items()}
 
+    def _summarize_scores(self, evaluated_answers: list[dict[str, Any]]) -> dict[str, float]:
+        if not evaluated_answers:
+            return {**{key: 0.0 for key in self.DIMENSION_WEIGHTS}, "overall_score": 0.0}
         count = float(len(evaluated_answers))
-        normalized = {key: round(value / count, 2) for key, value in totals.items()}
-        normalized["overall_score"] = round(sum(normalized.values()) / len(normalized), 2)
+        normalized = {
+            key: round(sum(float(item["dimension_scores"][key]) for item in evaluated_answers) / count, 2)
+            for key in self.DIMENSION_WEIGHTS
+        }
+        normalized["overall_score"] = round(
+            sum(normalized[key] * weight for key, weight in self.DIMENSION_WEIGHTS.items()), 2
+        )
         return normalized
 
     @staticmethod

@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
 
+    # Comma-separated list of allowed browser origins, or "*" for any.
+    cors_origins: str = "*"
+    # Built frontend served at /app when this directory exists.
+    frontend_dist_dir: str = "frontend/dist"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [item.strip() for item in self.cors_origins.split(",") if item.strip()] or ["*"]
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

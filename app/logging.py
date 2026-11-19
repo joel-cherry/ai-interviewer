@@ -23,7 +23,7 @@ def configure_logging() -> None:
     if settings.log_format == "json":
         processors.append(structlog.processors.JSONRenderer())
     else:
-        processors.append(structlog.processors.ConsoleRenderer())
+        processors.append(structlog.dev.ConsoleRenderer())
 
     structlog.configure(
         processors=processors,
